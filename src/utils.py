@@ -1,5 +1,7 @@
 import re
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+from .config import BASE_URL
 
 
 def extract_real_url(raw_url):
@@ -10,6 +12,14 @@ def extract_real_url(raw_url):
         if "url" in qs and qs["url"]:
             return unquote(qs["url"][0])
     return raw_url
+
+
+def build_preview_url(real_url, width, quality=75):
+    if not real_url:
+        return real_url
+    if "/_next/image" in real_url:
+        return real_url
+    return f"{BASE_URL}/_next/image?url={quote(real_url, safe='')}&w={width}&q={quality}"
 
 
 def slugify(text):

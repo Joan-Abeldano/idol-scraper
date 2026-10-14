@@ -7,9 +7,12 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
+from .cache import LRUImageCache
 from .config import (
+    ALBUM_CACHE_CAPACITY,
     ALBUM_WORKERS,
     BASE_URL,
+    DIRECTORY_WORKERS,
     HEADERS,
     PHOTO_PAGE_LIMIT,
     REQUEST_TIMEOUT,
@@ -32,19 +35,22 @@ class KpoppingScraper:
     def __init__(self, session, db=None):
         self.session = session
         self.db = db
-        self._album_cache = {}
+        self._album_cache = LRUImageCache(capacity=ALBUM_CACHE_CAPACITY)
 
     def harvest_directory(self, known_idols=None):
         found_idols = {item["slug"]: item for item in (known_idols or [])}
         alphabet = ["num"] + list(string.ascii_uppercase)
 
-        for letter in alphabet:
+        yield EVENT_STATUS, "Fetching idol directory sections..."
+        with ThreadPoolExecutor(max_workers=DIRECTORY_WORKERS) as executor:
+            pages = list(executor.map(self._fetch_section, alphabet))
+
+        for letter, html in zip(alphabet, pages):
             yield EVENT_STATUS, f"Scanning letter section '{letter}'..."
-            target_url = f"{BASE_URL}/idols/female?letter={letter}"
+            if not html:
+                continue
 
             try:
-                resp = self.session.get(target_url, headers=RSC_HEADERS, timeout=REQUEST_TIMEOUT)
-                html = resp.text
                 batch = []
 
                 json_matches = re.findall(
@@ -125,6 +131,16 @@ class KpoppingScraper:
             except Exception:
                 pass
 
+    def _fetch_section(self, letter):
+        target_url = f"{BASE_URL}/idols/female?letter={letter}"
+        try:
+            resp = self.session.get(
+                target_url, headers=RSC_HEADERS, timeout=REQUEST_TIMEOUT
+            )
+            return resp.text
+        except Exception:
+            return None
+
     def scrape_group_members(self, group_name):
         slug = slugify(group_name)
         candidates = [
@@ -184,8 +200,9 @@ class KpoppingScraper:
         if cancel_evt is not None and cancel_evt.is_set():
             return []
 
-        if slug in self._album_cache:
-            return self._album_cache[slug]
+        cached = self._album_cache.get(slug)
+        if cached is not None:
+            return cached
 
         album_url = f"{BASE_URL}/kpics/{slug}"
         photos = []
@@ -227,7 +244,7 @@ class KpoppingScraper:
         except Exception:
             pass
 
-        self._album_cache[slug] = photos
+        self._album_cache.put(slug, photos)
         return photos
 
     def fetch_idol_photos(

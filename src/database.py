@@ -8,12 +8,16 @@ class DatabaseManager:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
         self._lock = threading.Lock()
+        self._local = threading.local()
         self._init_db()
 
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=20.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=20.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            self._local.conn = conn
         return conn
 
     def _init_db(self):
@@ -53,26 +57,30 @@ class DatabaseManager:
             ]
 
     def save_idols_batch(self, idols_list):
+        rows = [
+            {
+                "slug": item["slug"],
+                "raw_name": item["raw_name"],
+                "name": item["name"],
+                "url": item["url"],
+                "uuid": item.get("uuid"),
+                "group": item.get("group", ""),
+            }
+            for item in idols_list
+        ]
+        if not rows:
+            return
         with self._lock, self._get_connection() as conn:
-            for item in idols_list:
-                group_val = item.get("group", "")
-                conn.execute(
-                    """
-                    INSERT INTO idols (slug, raw_name, display_name, url, uuid, group_name)
-                    VALUES (:slug, :raw_name, :name, :url, :uuid, :group)
-                    ON CONFLICT(slug) DO UPDATE SET
-                        group_name = CASE WHEN excluded.group_name != '' THEN excluded.group_name ELSE idols.group_name END,
-                        display_name = excluded.display_name
-                    """,
-                    {
-                        "slug": item["slug"],
-                        "raw_name": item["raw_name"],
-                        "name": item["name"],
-                        "url": item["url"],
-                        "uuid": item.get("uuid"),
-                        "group": group_val,
-                    },
-                )
+            conn.executemany(
+                """
+                INSERT INTO idols (slug, raw_name, display_name, url, uuid, group_name)
+                VALUES (:slug, :raw_name, :name, :url, :uuid, :group)
+                ON CONFLICT(slug) DO UPDATE SET
+                    group_name = CASE WHEN excluded.group_name != '' THEN excluded.group_name ELSE idols.group_name END,
+                    display_name = excluded.display_name
+                """,
+                rows,
+            )
             conn.commit()
 
     def update_uuid(self, slug, uuid):

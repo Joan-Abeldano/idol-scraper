@@ -2,6 +2,7 @@ import os
 import queue
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from tkinter import messagebox, simpledialog, ttk
 
@@ -13,6 +14,11 @@ from ..config import (
     DB_PATH,
     DOWNLOAD_ROOT,
     HEADERS,
+    PREFETCH_LIMIT,
+    PREVIEW_MAX_PX,
+    PREVIEW_QUALITY,
+    PREVIEW_TIMEOUT,
+    PREVIEW_WIDTH,
     SEARCH_DEBOUNCE_MS,
     THUMB_CACHE_CAPACITY,
 )
@@ -20,8 +26,9 @@ from ..database import DatabaseManager
 from ..downloader import PhotoDownloader
 from ..http import create_session
 from ..scraper import EVENT_IDOLS, EVENT_STATUS, KpoppingScraper
-from ..utils import sanitize_filename
+from ..utils import build_preview_url, sanitize_filename
 from .idol_panel import IdolPanel
+from .loading_overlay import LoadingOverlay
 from .photo_panel import PhotoPanel
 from .preview_panel import PreviewPanel
 from .status_bar import StatusBar
@@ -40,6 +47,8 @@ class KpoppingCompleteBrowser(tk.Tk):
         self.scraper = KpoppingScraper(self.session, self.db)
         self.downloader = PhotoDownloader(self.session, DOWNLOAD_ROOT)
 
+        cached_idols = self.db.get_all_idols()
+
         self.all_idols = []
         self.displayed_idols = []
         self.current_photos = []
@@ -47,27 +56,38 @@ class KpoppingCompleteBrowser(tk.Tk):
         self.active_group_filter = ""
         self._search_timer = None
 
+        self._idols_by_slug = {}
+        self._refilter_scheduled = False
+        self._last_idol_names = []
+        self._initial_selection_done = False
+        self._loading = not cached_idols
+        self._focus_list_pending = False
+
         self._thumb_cache = LRUImageCache(capacity=THUMB_CACHE_CAPACITY)
         self._current_fetch_id = 0
         self._current_render_id = 0
         self._cancel_signal = threading.Event()
         self._ui_queue = queue.Queue()
 
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="preview-prefetch"
+        )
+        self._prefetch_inflight = set()
+        self._prefetch_lock = threading.Lock()
+
         self._build_ui()
         self._bind_keys()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(50, self._drain_ui_queue)
 
-        cached = self.db.get_all_idols()
-        if cached:
-            self._append_idols(cached)
-            self.set_status(
-                f"Loaded {len(cached):,} idols from cache"
-                "Checking for updates in background..."
-            )
+        if cached_idols:
+            self._append_idols(cached_idols)
+            self.set_status(f"Loaded {len(cached_idols):,} idols from cache.")
         else:
             self.set_status("Initializing idol directory...")
-
-        threading.Thread(target=self.load_all_idols_master, daemon=True).start()
+            threading.Thread(
+                target=self.load_all_idols_master, args=([],), daemon=True
+            ).start()
 
     def _build_ui(self):
         self.toolbar = Toolbar(
@@ -97,6 +117,10 @@ class KpoppingCompleteBrowser(tk.Tk):
         self.status_bar = StatusBar(self)
         self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
+        self.loading_overlay = LoadingOverlay(self)
+        if self._loading:
+            self.loading_overlay.show("Loading idol directory...")
+
     def _bind_keys(self):
         self.idol_panel.listbox.bind(
             "<Right>", lambda e: self.photo_panel.focus_list()
@@ -111,6 +135,8 @@ class KpoppingCompleteBrowser(tk.Tk):
         self.bind("<Escape>", lambda e: self.clear_group_filter())
 
     def _handle_y_key(self, event):
+        if self._loading:
+            return "break"
         if isinstance(event.widget, (ttk.Entry, tk.Entry)):
             return
         self.prompt_group_search()
@@ -140,6 +166,8 @@ class KpoppingCompleteBrowser(tk.Tk):
         self._search_timer = self.after(SEARCH_DEBOUNCE_MS, self.filter_idols)
 
     def prompt_group_search(self):
+        if self._loading:
+            return
         group_query = simpledialog.askstring(
             "Search by Group",
             "Enter group name (e.g., NewJeans, BABYMONSTER, aespa):",
@@ -164,6 +192,8 @@ class KpoppingCompleteBrowser(tk.Tk):
             threading.Thread(
                 target=self._scrape_group_members_online, args=(group_query,), daemon=True
             ).start()
+        else:
+            self._focus_results()
 
     def clear_group_filter(self):
         if not self.active_group_filter:
@@ -177,7 +207,7 @@ class KpoppingCompleteBrowser(tk.Tk):
         found_members = self.scraper.scrape_group_members(group_name)
 
         if found_members:
-            self._post(self._append_idols, found_members)
+            self._post(self._append_idols_then_focus, found_members)
             self._post(
                 self.set_status,
                 f"Discovered {len(found_members)} members for '{group_name}'",
@@ -187,40 +217,82 @@ class KpoppingCompleteBrowser(tk.Tk):
                 self.set_status, f"No group or members found matching '{group_name}'"
             )
 
-    def load_all_idols_master(self):
-        for kind, payload in self.scraper.harvest_directory(self.all_idols):
-            if kind == EVENT_STATUS:
-                self._post(self.set_status, payload)
-            elif kind == EVENT_IDOLS:
-                self._post(self._append_idols, payload)
+    def _append_idols_then_focus(self, members):
+        self._append_idols(members)
+        self._focus_list_pending = True
+        self._schedule_refilter()
 
-        self._post(
-            lambda: self.set_status(
-                f"Loaded all {len(self.all_idols):,} idols"
-            )
-        )
+    def _focus_results(self):
+        if not self.displayed_idols:
+            return
+        if self.idol_panel.selected_index() is None:
+            self.idol_panel.select_first()
+            self.on_idol_selected(None)
+        self.idol_panel.focus_list()
+
+    def load_all_idols_master(self, known_idols):
+        try:
+            for kind, payload in self.scraper.harvest_directory(known_idols):
+                if kind == EVENT_STATUS:
+                    self._post(self._on_harvest_status, payload)
+                elif kind == EVENT_IDOLS:
+                    self._post(self._append_idols, payload)
+        finally:
+            self._post(self._finish_initial_load)
+
+    def _on_harvest_status(self, text):
+        self.set_status(text)
+        if self._loading:
+            self.loading_overlay.set_message(text)
+
+    def _finish_initial_load(self):
+        self._loading = False
+        self.loading_overlay.hide()
+        self._schedule_refilter()
+        self.set_status(f"Loaded all {len(self.all_idols):,} idols")
 
     def _append_idols(self, new_batch):
-        is_first_load = len(self.all_idols) == 0
-
-        existing = {item["slug"]: item for item in self.all_idols}
+        changed = False
         for item in new_batch:
             slug = item["slug"]
-            if slug not in existing:
+            existing = self._idols_by_slug.get(slug)
+            if existing is None:
                 self.all_idols.append(item)
-                existing[slug] = item
-            else:
-                if item.get("group") and not existing[slug].get("group"):
-                    existing[slug]["group"] = item["group"]
-                    existing[slug]["name"] = item["name"]
+                self._idols_by_slug[slug] = item
+                changed = True
+            elif item.get("group") and not existing.get("group"):
+                existing["group"] = item["group"]
+                existing["name"] = item["name"]
+                changed = True
 
+        if changed:
+            self._schedule_refilter()
+
+    def _schedule_refilter(self):
+        if self._refilter_scheduled:
+            return
+        self._refilter_scheduled = True
+        self.after_idle(self._run_refilter)
+
+    def _run_refilter(self):
+        self._refilter_scheduled = False
         self.all_idols.sort(key=lambda x: x["raw_name"].lower())
-        self.filter_idols()
 
-        if is_first_load and self.displayed_idols:
-            self.idol_panel.select_first()
-            self.idol_panel.focus_list()
-            self.on_idol_selected(None)
+        self.filter_idols()
+        self._select_first_if_needed()
+        if self._focus_list_pending:
+            self._focus_list_pending = False
+            self._focus_results()
+
+    def _select_first_if_needed(self):
+        if self._loading or self._initial_selection_done:
+            return
+        if not self.displayed_idols:
+            return
+        self._initial_selection_done = True
+        self.idol_panel.select_first()
+        self.idol_panel.focus_list()
+        self.on_idol_selected(None)
 
     def filter_idols(self, *args):
         idol_query = self.toolbar.search_text().strip().lower()
@@ -241,8 +313,11 @@ class KpoppingCompleteBrowser(tk.Tk):
 
         current_name = self.idol_panel.selected_name()
 
+        names = [item["name"] for item in filtered]
         self.displayed_idols = filtered
-        self.idol_panel.set_items([item["name"] for item in filtered])
+        if names != self._last_idol_names:
+            self._last_idol_names = names
+            self.idol_panel.set_items(names)
 
         total = len(self.all_idols)
         matched = len(self.displayed_idols)
@@ -324,45 +399,101 @@ class KpoppingCompleteBrowser(tk.Tk):
         self._current_render_id += 1
         render_id = self._current_render_id
 
-        cached_entry = self._thumb_cache.get(img_url)
-        if cached_entry:
-            raw_img, dimensions = cached_entry
-            self.preview_panel.show_image(raw_img, dimensions)
-            return
+        if self._thumb_cache.get(img_url) is None:
+            self.preview_panel.show_message("Loading preview...")
 
-        self.preview_panel.show_message("Loading preview...")
         threading.Thread(
             target=self.render_thumbnail, args=(img_url, render_id), daemon=True
         ).start()
+        self._prefetch_neighbors(index)
+
+    def _load_preview_bytes(self, url):
+        candidates = list(
+            dict.fromkeys([build_preview_url(url, PREVIEW_WIDTH, PREVIEW_QUALITY), url])
+        )
+        for candidate in candidates:
+            try:
+                resp = self.session.get(
+                    candidate, headers=HEADERS, timeout=PREVIEW_TIMEOUT
+                )
+                if resp.status_code == 200 and resp.content:
+                    return resp.content
+            except Exception:
+                continue
+        return None
+
+    def _decode_preview(self, data):
+        img = Image.open(BytesIO(data))
+        # Decode JPEGs at a reduced scale instead of full resolution.
+        img.draft("RGB", (PREVIEW_MAX_PX, PREVIEW_MAX_PX))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        img.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX), Image.Resampling.LANCZOS)
+        return img
+
+    def _prefetch_neighbors(self, index):
+        if not self.current_photos:
+            return
+
+        generation = self._current_fetch_id
+        start = max(0, index - PREFETCH_LIMIT)
+        end = min(len(self.current_photos), index + PREFETCH_LIMIT + 1)
+
+        for i in range(start, end):
+            if i == index:
+                continue
+            url = self.current_photos[i]["url"]
+            if self._thumb_cache.get(url) is not None:
+                continue
+            with self._prefetch_lock:
+                if url in self._prefetch_inflight:
+                    continue
+                self._prefetch_inflight.add(url)
+            self._prefetch_executor.submit(self._prefetch_one, generation, url)
+
+    def _prefetch_one(self, generation, url):
+        try:
+            if generation != self._current_fetch_id:
+                return
+            if self._thumb_cache.get(url) is not None:
+                return
+            data = self._load_preview_bytes(url)
+            if data is not None and generation == self._current_fetch_id:
+                self._thumb_cache.put(url, data)
+        except Exception:
+            pass
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_inflight.discard(url)
 
     def render_thumbnail(self, img_url, render_id):
-        try:
-            resp = self.session.get(img_url, headers=HEADERS, timeout=10)
-            if resp.status_code != 200 or render_id != self._current_render_id:
+        data = self._thumb_cache.get(img_url)
+        if data is None:
+            data = self._load_preview_bytes(img_url)
+            if data is None:
                 if render_id == self._current_render_id:
                     self._post(
                         self.preview_panel.show_message, "Preview not available"
                     )
                 return
+            self._thumb_cache.put(img_url, data)
 
-            img = Image.open(BytesIO(resp.content)).convert("RGBA")
-            orig_size = img.size
-            self._thumb_cache.put(img_url, (img, orig_size))
-
-            if render_id != self._current_render_id:
-                return
-
-            self._post(self._show_thumbnail_result, img, orig_size, render_id)
+        try:
+            img = self._decode_preview(data)
         except Exception:
             if render_id == self._current_render_id:
-                self._post(
-                    self.preview_panel.show_message, "Could not render preview"
-                )
+                self._post(self.preview_panel.show_message, "Could not render preview")
+            return
 
-    def _show_thumbnail_result(self, img, orig_size, render_id):
         if render_id != self._current_render_id:
             return
-        self.preview_panel.show_image(img, orig_size)
+
+        self._post(self._show_thumbnail_result, img, img.size, render_id)
+
+    def _show_thumbnail_result(self, img, dimensions, render_id):
+        if render_id != self._current_render_id:
+            return
+        self.preview_panel.show_image(img, dimensions)
 
     def download_selected(self):
         index = self.photo_panel.selected_index()
@@ -430,6 +561,10 @@ class KpoppingCompleteBrowser(tk.Tk):
     def _finish_batch_download(self, total):
         self.status_bar.reset_progress()
         self.set_status(f"Finished downloading {total:,} photos to {self.downloader.download_root}")
+
+    def _on_close(self):
+        self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+        self.destroy()
 
 
 def main():

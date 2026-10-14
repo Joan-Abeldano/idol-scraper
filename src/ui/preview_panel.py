@@ -3,6 +3,8 @@ from tkinter import ttk
 
 from PIL import Image, ImageTk
 
+from ..config import RESIZE_DEBOUNCE_MS
+
 
 class PreviewPanel(ttk.Labelframe):
     def __init__(self, master, on_download_selected, on_download_all):
@@ -10,6 +12,7 @@ class PreviewPanel(ttk.Labelframe):
 
         self._raw_image = None
         self._image_ref = None
+        self._resize_job = None
 
         self.canvas = tk.Canvas(self, bg="#181818", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -49,7 +52,7 @@ class PreviewPanel(ttk.Labelframe):
         self._raw_image = pil_image
         self._draw(pil_image)
         if dimensions:
-            self.set_meta(f"Resolution: {dimensions[0]} × {dimensions[1]}")
+            self.set_meta(f"Preview: {dimensions[0]} × {dimensions[1]}")
 
     def set_meta(self, text):
         self.meta_label.configure(text=text)
@@ -64,8 +67,14 @@ class PreviewPanel(ttk.Labelframe):
         avail_w = max(canvas_w - 20, 50)
         avail_h = max(canvas_h - 20, 50)
 
-        scaled = pil_image.copy()
-        scaled.thumbnail((avail_w, avail_h), Image.Resampling.LANCZOS)
+        img_w, img_h = pil_image.size
+        ratio = min(avail_w / img_w, avail_h / img_h)
+        if ratio < 1:
+            target = (max(int(img_w * ratio), 1), max(int(img_h * ratio), 1))
+            scaled = pil_image.resize(target, Image.Resampling.BILINEAR)
+        else:
+            scaled = pil_image
+
         photo_tk = ImageTk.PhotoImage(scaled)
 
         self._image_ref = photo_tk
@@ -75,5 +84,13 @@ class PreviewPanel(ttk.Labelframe):
         )
 
     def _on_resize(self, event):
-        if self._raw_image and event.width > 50 and event.height > 50:
+        if not self._raw_image or event.width <= 50 or event.height <= 50:
+            return
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(RESIZE_DEBOUNCE_MS, self._redraw)
+
+    def _redraw(self):
+        self._resize_job = None
+        if self._raw_image:
             self._draw(self._raw_image)
