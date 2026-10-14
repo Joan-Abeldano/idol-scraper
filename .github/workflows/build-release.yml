@@ -1,0 +1,49 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name IdolScraper main.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IdolScraper-exe
+          path: dist/IdolScraper.exe
+          if-no-files-found: error
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.${{ github.run_number }}
+          name: Release v0.0.${{ github.run_number }}
+          generate_release_notes: true
+          files: dist/IdolScraper.exe
+          fail_on_unmatched_files: true

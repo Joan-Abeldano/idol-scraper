@@ -1,7 +1,11 @@
 import os
+import sys
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = os.path.dirname(sys.executable)
+else:
+    PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
 
 DATA_DIR = os.environ.get("KPOP_DATA_DIR", PROJECT_ROOT)
 DOWNLOAD_ROOT = os.path.join(DATA_DIR, "kpop_downloaded")
